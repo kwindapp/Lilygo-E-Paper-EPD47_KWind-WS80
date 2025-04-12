@@ -34,7 +34,7 @@
 
 // Choose method: true = MQTT, false = ESP-NOW
 bool useMQTT = false;  
-const char* mqtt_server = "152.53.16.228";  
+const char* mqtt_server = "15xxxxxxx";  
 
 
 // Topic
