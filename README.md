@@ -1,3 +1,4 @@
+-ecowitt ws85 from helium net- to mqtt
 - mqtt topics
 - mqtt false = data over esp-now
 
