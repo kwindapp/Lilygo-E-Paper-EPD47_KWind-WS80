@@ -4,19 +4,10 @@
 #include "opensans10b.h"
 #include <ArduinoJson.h>
 #include <PubSubClient.h>  // MQTT library
-
-#include "epd_driver.h"
+#include <time.h>
 #include "opensans12b.h"
 #include "opensans18b.h"
 #include "opensans24b.h"
-#include <Arduino.h>
-#include <esp_task_wdt.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "epd_driver.h"
-#include "esp_adc_cal.h"
-#include <Wire.h>
-#include <SPI.h>
 
 
 #include "titel.h"
@@ -24,7 +15,6 @@
 #include "logo1.h"
 #include "logo2.h"
 #include "qr.h"
-
 #include "dir.h"
 #include "wind.h"
 #include "temp.h"
@@ -33,15 +23,20 @@
 
 
 // Choose method: true = MQTT, false = ESP-NOW
-bool useMQTT = false;  
-const char* mqtt_server = "15xxxxxxx";  
+bool useMQTT = true;  
+const char* mqtt_server = "15xxxxxxxx";  
 
 
 // Topic
 //const char* mqtt_topic = "KWind/data/WS80_Lora";
 const char* mqtt_topic = "helium/data";
 
-
+// For GMT
+const long gmtOffset_sec = -4 * 3600;
+const int daylightOffset_sec = 0;  // Adjust if DST applies
+// CH
+//const long gmtOffset_sec = 1 * 3600;   // UTC+1
+//const int daylightOffset_sec = 1 * 3600;  // Add 1 hour for DST
 
 
 WiFiClient espClient;
@@ -53,10 +48,7 @@ PubSubClient client(espClient);
 String localMac;
 // === DISPLAY ===
 uint8_t *framebuffer;
-
-
-
-// Set this to 1 if using MQTT, 0 if not
+unsigned long lastUpdateTime = 0;
 
 
 struct mqtt_message {
@@ -82,7 +74,7 @@ struct espnow_message {
 
 
 mqtt_message receivedData;
-// or
+
 
 
 
@@ -203,67 +195,74 @@ void mqttCallback(char* topic, byte* message, unsigned int length) {
 
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(1155);
   epd_init();
+
   framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
   if (!framebuffer) {
     Serial.println("❌ Framebuffer allocation failed!");
-    while (true)
-      ;
+    while (true);
   }
-  memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);  // clear
+  memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);  // Clear framebuffer
 
   epd_poweron();
   epd_clear();
+
   drawLayout();
   delay(1000);
+
+  // Start WiFi in station mode
   WiFi.mode(WIFI_STA);
+
+  // Connect to WiFi
+  WiFi.begin("Kwind", "12345678");  // TODO: Replace with actual SSID/pass
+  Serial.print("🔌 Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected");
+
+  // Show MAC address
   localMac = WiFi.macAddress();
   Serial.print("📡 MAC: ");
   Serial.println(localMac);
 
-  if (!useMQTT) {
-    WiFi.mode(WIFI_STA);
-    localMac = WiFi.macAddress();
-    Serial.print("📡 MAC: ");
-    Serial.println(localMac);
-  
+  // Time sync via NTP
+  Serial.print("⏳ Waiting for time sync");
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+
+  time_t now = time(nullptr);
+  int retries = 0;
+  while (now < 100000 && retries < 30) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    retries++;
+  }
+
+  if (now < 100000) {
+    Serial.println("\n❌ Failed to sync time!");
+  } else {
+    Serial.println("\n✅ Time synced");
+  }
+
+  // Start communication mode
+  if (useMQTT) {
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(mqttCallback);
+    Serial.println("📶 MQTT mode enabled");
+  } else {
     if (esp_now_init() != ESP_OK) {
       Serial.println("❌ ESP-NOW init failed!");
       return;
     }
     esp_now_register_recv_cb(onDataRecv);
+    Serial.println("📡 ESP-NOW mode enabled");
   }
 
- 
-  delay(6000);  // layout boxes and labels once
-                // initial blank/empty data
-                WiFi.begin("KWindMobile", "12345678");  // Replace with actual SSID/pass
-                while (WiFi.status() != WL_CONNECTED) {
-                  delay(500);
-                  Serial.print(".");
-                }
-                Serial.println("\n✅ WiFi connected");
-                
-                if (useMQTT) {
-                  client.setServer(mqtt_server, 1883);
-                  client.setCallback(mqttCallback);
-                } else {
-                  WiFi.mode(WIFI_STA);
-                  localMac = WiFi.macAddress();
-                  Serial.print("📡 MAC: ");
-                  Serial.println(localMac);
-                
-                  if (esp_now_init() != ESP_OK) {
-                    Serial.println("❌ ESP-NOW init failed!");
-                    return;
-                  }
-                
-                  esp_now_register_recv_cb(onDataRecv);
-                }
-                Serial.println(useMQTT ? "📶 MQTT mode enabled" : "📡 ESP-NOW mode enabled");
+  delay(6000);  // Wait before showing initial empty data layout
 }
-
 
 void drawLayout() {
   // Initial display text, labels, and empty areas
@@ -410,13 +409,30 @@ Rect_t areap7 = {
 
 epd_draw_grayscale_image(areap7, (uint8_t *)bat_data);
 epd_draw_image(areap7, (uint8_t *)bat_data, BLACK_ON_WHITE);
-
-
-
 }
 
+
+void draw_timestamp() {
+  // Get current system time
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  if (!timeinfo) return;  
+  // Format time as "HH:MM:SS"
+  char timeStr[32];
+  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+  // Clear the area before drawing the new time
+  Rect_t timestampArea = { 760, 420+ custom_y , 100, 20 };
+  epd_clear_area(timestampArea);
+  // Set cursor position
+  int cursor_x = 760;
+  int cursor_y = 440+ custom_y;  // Slight vertical offset for better baseline
+ 
+  writeln((GFXfont *)&OpenSans12B, timeStr, &cursor_x, &cursor_y, NULL);
+}
+
+
+
 void refreshData() {
-  
   // Area 1: Update Wind Speed
   Rect_t area1 = { 440, 20 + custom_y, .width = 220, .height = 50 };
   epd_clear_area(area1);  // Clear previous data in the Wind Speed area
@@ -486,10 +502,11 @@ cursor_x = 10;             // Starting X position for values
 cursor_y = 440 + custom_y;  // Starting Y position within the area
 writeln((GFXfont *)&OpenSans12B, model, &cursor_x, &cursor_y, NULL);  // print model
 
+draw_timestamp(); 
+
 }
 
 
-// === ESP-NOW RECEIVE CALLBACK ===
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
   Serial.println("\n📩 Data Received:");
   Serial.printf("Length: %d\n", len);
@@ -505,13 +522,14 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
     Serial.printf("🔋 Battery: %.2f V\n", receivedData.BatVoltage);
     delay(2000);
     // Refresh display with new data
+    lastUpdateTime = millis();  // Save current time for tracking
     refreshData(); 
   } else {
     Serial.println("⚠️ Invalid data size. Ignoring packet.");
   }
 }
 
-// === MAIN LOOP ===
+
 void loop() {
   if (useMQTT) {
     if (!client.connected()) {
